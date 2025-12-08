@@ -3,77 +3,122 @@ import express from "express";
 import fetch from "node-fetch";
 import { createClient } from "@supabase/supabase-js";
 
-// Verify environment variables
+// --------------------------------------------------
+// ENV CHECK
+// --------------------------------------------------
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
-  console.error('Error: Missing required environment variables. Please check your .env file.');
+  console.error('❌ Missing Supabase environment variables');
+  process.exit(1);
+}
+
+if (!process.env.OPENAI_API_KEY) {
+  console.error('❌ Missing OPENAI_API_KEY');
   process.exit(1);
 }
 
 const app = express();
 app.use(express.json());
 
+// --------------------------------------------------
+// SUPABASE CLIENT
+// --------------------------------------------------
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-/* -------------------------------------------------- */
-/* ENTRY POINT */
-/* -------------------------------------------------- */
-app.post("/analyze", async (req, res) => {
-  const { job_id } = req.body;
-  if (!job_id) return res.status(400).json({ error: "Missing job_id" });
+// --------------------------------------------------
+// SUPABASE HEALTH CHECK (ON STARTUP)
+// --------------------------------------------------
+(async () => {
+  const { error } = await supabase
+    .from("analysis_queue")
+    .select("id")
+    .limit(1);
 
-  processJob(job_id); // fire-and-forget
-  res.json({ success: true });
+  if (error) {
+    console.error("❌ Supabase connection failed:", error.message);
+    process.exit(1);
+  }
+
+  console.log("✅ Supabase connected successfully");
+})();
+
+// --------------------------------------------------
+// ENTRY POINT
+// --------------------------------------------------
+app.post("/analyze", async (req, res) => {
+  console.log("📡 Client connected:", req.ip);
+
+  const { job_id } = req.body;
+
+  if (!job_id) {
+    console.error("❌ job_id missing from request");
+    return res.status(400).json({ error: "Missing job_id" });
+  }
+
+  try {
+    processJob(job_id); // fire-and-forget
+    res.json({ success: true, message: "Job accepted" });
+  } catch (err) {
+    console.error("❌ Failed to start job:", err.message);
+    res.status(500).json({ error: "Worker unavailable" });
+  }
 });
 
-app.listen(process.env.PORT || 4000, () =>
-  console.log("✅ Background worker running")
-);
+// --------------------------------------------------
+app.listen(process.env.PORT || 4000, () => {
+  console.log("✅ Background worker running on port", process.env.PORT || 4000);
+});
 
-/* -------------------------------------------------- */
-/* MAIN JOB PROCESSOR */
-/* -------------------------------------------------- */
+// --------------------------------------------------
+// MAIN JOB PROCESSOR
+// --------------------------------------------------
 async function processJob(job_id) {
   const start = Date.now();
   console.log("🔄 Processing job:", job_id);
 
   try {
     /* -------- Fetch job -------- */
-    const { data: job } = await supabase
+    const { data: job, error: jobError } = await supabase
       .from("analysis_queue")
       .select("*")
       .eq("id", job_id)
       .single();
 
-    if (!job) throw new Error("Job not found");
+    if (jobError || !job) {
+      throw new Error("Job not found");
+    }
 
     await supabase
       .from("analysis_queue")
-      .update({ status: "processing", started_at: new Date().toISOString() })
+      .update({
+        status: "processing",
+        started_at: new Date().toISOString()
+      })
       .eq("id", job_id);
 
     /* -------- Fetch attempt -------- */
-    const { data: attempt } = await supabase
+    const { data: attempt, error: attemptError } = await supabase
       .from("attempts")
       .select("*")
       .eq("id", job.attempt_id)
       .single();
 
-    if (!attempt) throw new Error("Attempt not found");
+    if (attemptError || !attempt) {
+      throw new Error("Attempt not found");
+    }
 
     /* -------- Download video -------- */
-    const videoPath = job.video_url;
-    const fileName = videoPath.split("/").pop();
+    const fileName = job.video_url.split("/").pop();
 
-    const { data: videoBlob } = await supabase
+    const { data: videoBlob, error: downloadError } = await supabase
       .storage
       .from("recordings")
-      .download(videoPath);
+      .download(job.video_url);
 
-    if (!videoBlob || videoBlob.size === 0) {
-      throw new Error("Invalid video file");
+    if (downloadError || !videoBlob || videoBlob.size === 0) {
+      throw new Error("Invalid or missing video file");
     }
 
     /* -------- Whisper transcription -------- */
@@ -94,7 +139,7 @@ async function processJob(job_id) {
       }
     );
 
-    if (!whisperRes.ok) throw new Error("Whisper failed");
+    if (!whisperRes.ok) throw new Error("Whisper transcription failed");
 
     const whisper = await whisperRes.json();
     const transcript = whisper.text || "";
@@ -102,21 +147,16 @@ async function processJob(job_id) {
 
     /* -------- Speech quality check -------- */
     const wordCount = transcript.trim().split(/\s+/).filter(Boolean).length;
-    const duration =
-      segments.length > 0 ? segments[segments.length - 1].end : 0;
 
     if (wordCount < 15) {
       await supabase.from("attempts").update({
         transcript,
         scores: zeroScores(),
         metrics: zeroMetrics(),
-        feedback: [
-          {
-            ts: "00:00",
-            note:
-              "No meaningful speech was detected. Please record again with clear audio."
-          }
-        ],
+        feedback: [{
+          ts: "00:00",
+          note: "No meaningful speech detected. Please record again clearly."
+        }],
         recommended_articles: []
       }).eq("id", attempt.id);
 
@@ -124,12 +164,9 @@ async function processJob(job_id) {
       return;
     }
 
-    /* -------- GPT analysis -------- */
+    /* -------- GPT Analysis -------- */
     const transcriptForGPT = segments
-      .map(
-        s =>
-          `[${formatTime(s.start)}] ${s.text}`
-      )
+      .map(s => `[${formatTime(s.start)}] ${s.text}`)
       .join("\n");
 
     const gptRes = await fetch(
@@ -168,14 +205,10 @@ async function processJob(job_id) {
       updated_at: new Date().toISOString()
     }).eq("id", attempt.id);
 
-    /* -------- Complete job -------- */
     await completeJob(job_id);
 
     console.log(
-      `✅ Job ${job_id} completed in ${(
-        (Date.now() - start) /
-        1000
-      ).toFixed(1)}s`
+      `✅ Job ${job_id} completed in ${((Date.now() - start) / 1000).toFixed(1)}s`
     );
 
   } catch (err) {
@@ -187,9 +220,9 @@ async function processJob(job_id) {
   }
 }
 
-/* -------------------------------------------------- */
-/* HELPERS */
-/* -------------------------------------------------- */
+// --------------------------------------------------
+// HELPERS
+// --------------------------------------------------
 function formatTime(sec) {
   const m = Math.floor(sec / 60);
   const s = Math.floor(sec % 60);
