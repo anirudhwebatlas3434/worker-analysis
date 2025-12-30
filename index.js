@@ -210,23 +210,64 @@ async function processJob(job_id) {
       }
     );
 
+    // Log response status for debugging
+    console.log(`Whisper API response status: ${whisperRes.status}`);
+
     if (!whisperRes.ok) {
       const errText = await whisperRes.text();
-      console.error("Whisper error:", errText);
-      throw new Error(`Whisper transcription failed: ${errText}`);
+      console.error("Whisper API error response:", errText);
+      throw new Error(`Whisper transcription failed (${whisperRes.status}): ${errText}`);
     }
 
-    const whisper = await whisperRes.json();
-    
-    if (!whisper.text) {
-      throw new Error('Whisper API returned invalid response: missing text field');
+    let whisper;
+    try {
+      const responseText = await whisperRes.text();
+      console.log('Whisper API raw response preview:', responseText.substring(0, 200));
+      whisper = JSON.parse(responseText);
+    } catch (parseError) {
+      console.error('Failed to parse Whisper response:', parseError.message);
+      throw new Error(`Whisper API returned invalid JSON: ${parseError.message}`);
     }
 
-    const transcript = whisper.text;
-    const segments = whisper.segments || [];
+    // More robust validation of Whisper response
+    if (!whisper || typeof whisper !== 'object') {
+      console.error('Whisper response is not an object:', whisper);
+      throw new Error('Whisper API returned invalid response: not an object');
+    }
+
+    // Check for text field with multiple fallbacks
+    let transcript = '';
+    let segments = [];
+
+    if (whisper.text !== undefined && whisper.text !== null) {
+      transcript = String(whisper.text).trim();
+    } else if (whisper.segments && Array.isArray(whisper.segments)) {
+      // Try to reconstruct text from segments if main text field is missing
+      transcript = whisper.segments.map(seg => seg.text || '').join(' ').trim();
+      console.log('Reconstructed transcript from segments');
+    } else {
+      console.error('Whisper response structure:', JSON.stringify(whisper, null, 2));
+      throw new Error('Whisper API returned invalid response: missing both text field and segments');
+    }
+
+    // Get segments if available
+    if (whisper.segments && Array.isArray(whisper.segments)) {
+      segments = whisper.segments;
+    } else {
+      console.warn('Whisper response missing segments array, creating single segment');
+      segments = [{
+        start: 0,
+        end: whisper.duration || 0,
+        text: transcript
+      }];
+    }
+
     const whisperDuration = ((Date.now() - whisperStartTime) / 1000).toFixed(2);
     
-    console.log(`Transcription completed in ${whisperDuration}s, length: ${transcript.length}, segments: ${segments.length}`);
+    console.log(`Transcription completed in ${whisperDuration}s`);
+    console.log(`Transcript length: ${transcript.length} chars`);
+    console.log(`Segments: ${segments.length}`);
+    console.log(`Transcript preview: ${transcript.substring(0, 100)}...`);
 
     // --------------------------------------------------
     // Speech quality gate
@@ -504,6 +545,7 @@ REMEMBER: Use the FULL scoring range 0-100. Don't artificially inflate scores.`;
 
   } catch (err) {
     console.error("❌ Worker error:", err.message);
+    console.error("Error stack:", err.stack);
     
     // Get current retry count and update job
     try {
