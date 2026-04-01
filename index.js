@@ -291,6 +291,24 @@ async function processJob(job_id) {
     if (isGibberish) {
       console.warn('No meaningful speech detected in recording');
       
+      const emptyExaminerNoticed = {
+        summary: 'No speech was detected in your recording. The examiner could not assess your performance.',
+        key_strengths: [],
+        priority_improvements: ['Ensure your microphone is working and positioned correctly', 'Speak clearly and at a moderate pace during the interview'],
+        notable_moments: []
+      };
+      
+      const emptyAnnotatedTranscript = segments.map((seg, idx) => {
+        const startMin = Math.floor(seg.start / 60);
+        const startSec = Math.floor(seg.start % 60);
+        return {
+          segment_index: idx,
+          timestamp: `${String(startMin).padStart(2, '0')}:${String(startSec).padStart(2, '0')}`,
+          text: seg.text || '',
+          annotations: []
+        };
+      });
+      
       await supabase.from("attempts").update({
         transcript: transcript || '(No speech detected)',
         scores: zeroScores(),
@@ -305,6 +323,9 @@ async function processJob(job_id) {
           ts: '00:00',
           note: 'No speech was detected in your recording. Please ensure your microphone is working and speak clearly during the interview.'
         }],
+        coaching_cues: [],
+        annotated_transcript: emptyAnnotatedTranscript,
+        examiner_noticed: emptyExaminerNoticed,
         recommended_articles: [],
         updated_at: new Date().toISOString()
       }).eq("id", attempt.id);
@@ -378,6 +399,40 @@ Return a JSON response with this exact structure:
     "eyeContactPct": null,
     "headPoseNotes": "Visual analysis not available from audio transcript"
   },
+  "coaching_cues": [
+    {
+      "type": "pacing|structure|depth|linking",
+      "content": "<specific actionable coaching cue>",
+      "timestamp": <number - seconds from start, or null if general>,
+      "severity": "strength|improvement|critical",
+      "criterion": "Structure|Communication|Empathy|Ethics|Professionalism|Motivation|Teamwork|General"
+    }
+  ],
+  "annotated_transcript": [
+    {
+      "segment_index": <number>,
+      "timestamp": "mm:ss",
+      "text": "<segment text>",
+      "annotations": [
+        {
+          "type": "strength|improvement",
+          "note": "<brief annotation>",
+          "criterion": "Structure|Communication|Empathy|Ethics|Professionalism|Motivation|Teamwork"
+        }
+      ]
+    }
+  ],
+  "examiner_noticed": {
+    "summary": "<2-3 sentence overall impression>",
+    "key_strengths": ["<strength 1>", "<strength 2>"],
+    "priority_improvements": ["<improvement 1>", "<improvement 2>"],
+    "notable_moments": [
+      {
+        "timestamp": "mm:ss",
+        "description": "<what the examiner noticed at this moment>"
+      }
+    ]
+  },
   "feedback": [
     {"ts": "mm:ss", "note": "<specific critical feedback>"},
     {"ts": "mm:ss", "note": "<specific critical feedback>"}
@@ -391,7 +446,25 @@ CRITICAL RULES FOR FEEDBACK:
 4. Each feedback note MUST reference what the candidate ACTUALLY SAID at that specific timestamp
 5. NEVER invent or hallucinate things the candidate didn't say
 6. For normal-length responses: provide 3-5 feedback items spread across the interview
-7. Be SPECIFIC and CRITICAL - point out weaknesses, vagueness, lack of examples`;
+7. Be SPECIFIC and CRITICAL - point out weaknesses, vagueness, lack of examples
+
+COACHING CUES GUIDELINES:
+- Generate 4-8 coaching cues covering: pacing (speed/rushing/pauses), structure (organization/signposting), depth (detail/examples), linking (connections between ideas)
+- Each cue MUST reference a specific timestamp where the issue/strength occurs (except general cues)
+- Use severity: "strength" for things done well, "improvement" for moderate issues, "critical" for serious problems
+- Be SPECIFIC and ACTIONABLE - e.g., "At 01:23, you rushed through your key example. Slow down and emphasise the patient impact."
+
+ANNOTATED TRANSCRIPT GUIDELINES:
+- For each transcript segment, analyze and add inline annotations marking strengths and improvements
+- Annotations must reference specific criteria (Structure, Communication, Empathy, Ethics, Professionalism, Motivation, Teamwork)
+- Focus on the most significant 1-2 points per segment (not every minor issue)
+- Use direct quotes or references to what was actually said
+
+EXAMINER NOTICED GUIDELINES:
+- summary: A concise 2-3 sentence impression that captures the overall candidate performance
+- key_strengths: 1-2 specific strengths that stood out (can be empty if none)
+- priority_improvements: 1-2 highest-priority areas for improvement (focus on what would most improve their score)
+- notable_moments: Key timestamps where something significant happened (impressive answer, major gap, recovery, etc.)`;
 
     const userPrompt = `Here is the timestamped transcript of the candidate's MMI interview response:
 
@@ -410,6 +483,9 @@ ASSESSMENT INSTRUCTIONS:
 5. CRITICALLY assess the CONTENT - be HARSH and HONEST, not lenient
 6. If they said very little (under 30 words) - scores should be 0-10% and provide ONLY ONE feedback item
 7. DO NOT HALLUCINATE - only reference what was ACTUALLY said in the transcript above
+8. Generate coaching cues covering pacing, structure, depth, and linking with specific timestamps
+9. Annotate each transcript segment with 0-2 inline annotations (strengths/improvements)
+10. Create a concise Examiner Noticed summary with key strengths, priority improvements, and notable moments
 
 REMEMBER: Use the FULL scoring range 0-100. Don't artificially inflate scores.`;
 
@@ -481,6 +557,75 @@ REMEMBER: Use the FULL scoring range 0-100. Don't artificially inflate scores.`;
       );
     }
 
+    // Validate and process coaching_cues with 30-second grace period
+    const GRACE_PERIOD_SECONDS = 30;
+    if (!analysis.coaching_cues || !Array.isArray(analysis.coaching_cues)) {
+      console.warn('GPT response missing coaching_cues, using empty array');
+      analysis.coaching_cues = [];
+    } else {
+      analysis.coaching_cues = analysis.coaching_cues
+        .filter(cue => cue && typeof cue === 'object' && cue.type && cue.content)
+        .map(cue => ({
+          type: cue.type || 'general',
+          content: cue.content,
+          timestamp: cue.timestamp !== undefined ? cue.timestamp : null,
+          severity: cue.severity || 'improvement',
+          criterion: cue.criterion || 'General',
+          // Mark cues that fall within grace period
+          is_grace_period: cue.timestamp !== null && cue.timestamp !== undefined && cue.timestamp < GRACE_PERIOD_SECONDS
+        }));
+    }
+    
+    const gracePeriodCueCount = analysis.coaching_cues.filter(c => c.is_grace_period).length;
+    const activeCueCount = analysis.coaching_cues.filter(c => !c.is_grace_period).length;
+    console.log(`Coaching cues: ${analysis.coaching_cues.length} total (${gracePeriodCueCount} in grace period, ${activeCueCount} active)`);
+
+    // Validate annotated_transcript
+    if (!analysis.annotated_transcript || !Array.isArray(analysis.annotated_transcript)) {
+      console.warn('GPT response missing annotated_transcript, generating from segments');
+      analysis.annotated_transcript = segments.map((seg, idx) => {
+        const startMin = Math.floor(seg.start / 60);
+        const startSec = Math.floor(seg.start % 60);
+        return {
+          segment_index: idx,
+          timestamp: `${String(startMin).padStart(2, '0')}:${String(startSec).padStart(2, '0')}`,
+          text: seg.text || '',
+          annotations: []
+        };
+      });
+    } else {
+      analysis.annotated_transcript = analysis.annotated_transcript
+        .filter(item => item && typeof item === 'object')
+        .map((item, idx) => ({
+          segment_index: item.segment_index !== undefined ? item.segment_index : idx,
+          timestamp: item.timestamp || '00:00',
+          text: item.text || '',
+          annotations: Array.isArray(item.annotations) 
+            ? item.annotations.filter(a => a && a.type && a.note)
+            : []
+        }));
+    }
+    console.log(`Annotated transcript segments: ${analysis.annotated_transcript.length}`);
+
+    // Validate examiner_noticed
+    if (!analysis.examiner_noticed || typeof analysis.examiner_noticed !== 'object') {
+      console.warn('GPT response missing examiner_noticed, generating from cues');
+      analysis.examiner_noticed = generateExaminerNoticedFallback(analysis.coaching_cues, analysis.scores);
+    } else {
+      analysis.examiner_noticed = {
+        summary: analysis.examiner_noticed.summary || 'No summary available.',
+        key_strengths: Array.isArray(analysis.examiner_noticed.key_strengths) 
+          ? analysis.examiner_noticed.key_strengths.filter(s => typeof s === 'string')
+          : [],
+        priority_improvements: Array.isArray(analysis.examiner_noticed.priority_improvements)
+          ? analysis.examiner_noticed.priority_improvements.filter(i => typeof i === 'string')
+          : [],
+        notable_moments: Array.isArray(analysis.examiner_noticed.notable_moments)
+          ? analysis.examiner_noticed.notable_moments.filter(m => m && m.timestamp && m.description)
+          : []
+      };
+    }
+
     // CRITICAL: Cap scores at 30% for responses <= 2 minutes
     if (totalDuration <= 120) {
       console.log(`Response duration ${totalDuration.toFixed(1)}s <= 2 minutes - capping all scores at 30%`);
@@ -535,6 +680,9 @@ REMEMBER: Use the FULL scoring range 0-100. Don't artificially inflate scores.`;
       scores: analysis.scores,
       metrics: analysis.metrics,
       feedback: analysis.feedback,
+      coaching_cues: analysis.coaching_cues,
+      annotated_transcript: analysis.annotated_transcript,
+      examiner_noticed: analysis.examiner_noticed,
       recommended_articles: recommendedArticleIds,
       updated_at: new Date().toISOString()
     }).eq("id", attempt.id);
@@ -585,6 +733,51 @@ function zeroScores() {
     Motivation: 0,
     Teamwork: 0,
     Overall: 0
+  };
+}
+
+function generateExaminerNoticedFallback(coachingCues, scores) {
+  const strengths = coachingCues
+    .filter(c => c.severity === 'strength')
+    .slice(0, 2)
+    .map(c => c.content);
+  
+  const improvements = coachingCues
+    .filter(c => c.severity === 'critical' || c.severity === 'improvement')
+    .slice(0, 2)
+    .map(c => c.content);
+  
+  const notableMoments = coachingCues
+    .filter(c => c.timestamp !== null && c.timestamp !== undefined)
+    .slice(0, 3)
+    .map(c => {
+      const min = Math.floor(c.timestamp / 60);
+      const sec = Math.floor(c.timestamp % 60);
+      return {
+        timestamp: `${String(min).padStart(2, '0')}:${String(sec).padStart(2, '0')}`,
+        description: `${c.type}: ${c.content.substring(0, 100)}${c.content.length > 100 ? '...' : ''}`
+      };
+    });
+  
+  const overallScore = scores?.Overall || 0;
+  let summary = 'No meaningful speech detected in this recording.';
+  if (overallScore > 0) {
+    if (overallScore < 30) {
+      summary = 'The candidate showed limited engagement with the question, requiring significant development in all assessed areas.';
+    } else if (overallScore < 60) {
+      summary = 'The candidate demonstrated some understanding but showed considerable room for improvement across multiple criteria.';
+    } else if (overallScore < 80) {
+      summary = 'The candidate performed reasonably well with some notable strengths, though several areas could be strengthened.';
+    } else {
+      summary = 'The candidate delivered a strong performance with clear evidence of good preparation and understanding.';
+    }
+  }
+  
+  return {
+    summary,
+    key_strengths: strengths,
+    priority_improvements: improvements,
+    notable_moments: notableMoments
   };
 }
 
