@@ -675,7 +675,7 @@ REMEMBER: Use the FULL scoring range 0-100. Don't artificially inflate scores.`;
     // --------------------------------------------------
     // Update attempt with results
     // --------------------------------------------------
-    await supabase.from("attempts").update({
+    const { error: updateError } = await supabase.from("attempts").update({
       transcript,
       scores: analysis.scores,
       metrics: analysis.metrics,
@@ -686,6 +686,13 @@ REMEMBER: Use the FULL scoring range 0-100. Don't artificially inflate scores.`;
       recommended_articles: recommendedArticleIds,
       updated_at: new Date().toISOString()
     }).eq("id", attempt.id);
+    
+    if (updateError) {
+      console.error("❌ Failed to update attempts table:", updateError.message);
+      throw new Error(`Database update failed: ${updateError.message}`);
+    }
+    
+    console.log(`✅ Attempt ${attempt.id} updated with ${analysis.coaching_cues.length} cues, ${analysis.annotated_transcript.length} annotated segments`);
 
     await completeJob(job_id);
     const processingDuration = ((Date.now() - jobStartTime) / 1000).toFixed(2);
