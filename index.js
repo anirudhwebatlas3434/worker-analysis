@@ -502,7 +502,7 @@ REMEMBER: Use the FULL scoring range 0-100. Don't artificially inflate scores.`;
           { role: "system", content: systemPrompt },
           { role: "user", content: userPrompt }
         ],
-        max_tokens: 1000,
+        max_tokens: 2500,
         temperature: 0.3
       })
     });
